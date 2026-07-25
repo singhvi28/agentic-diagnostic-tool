@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     cursor_model: str = "composer-2.5"
 
     target_app_root: Path = Path("./examples/target_app")
+    target_app_import: str = "examples.target_app.main:app"
     error_log_path: Path = Path("./logs/app_errors.log")
     sandbox_root: Path = Path("./examples/target_app")
     patch_backup_root: Path = Path("./patches")

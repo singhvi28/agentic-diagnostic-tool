@@ -199,7 +199,14 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
         f"Previous Test Result:\n{json.dumps(state.get('test_result'), default=str)}\n\n"
         "Respond as JSON with keys: root_cause_analysis (str), "
         "proposed_patch (object mapping filename -> full new file content), "
-        "reproduction_test_code (pytest using httpx.ASGITransport against examples.target_app.main:app)."
+        "reproduction_test_code (either a JSON HTTP suite "
+        '[{"method":"GET","path":"/health","expect_status":200}] '
+        "or Python with async test_* functions taking `client` "
+        "(httpx.AsyncClient on ASGITransport — in-process, no pytest subprocess))."
+    )
+
+    stub_suite = (
+        '[{"method": "GET", "path": "/health", "expect_status": 200}]'
     )
 
     if not settings.has_llm_credentials():
@@ -214,7 +221,7 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
                     f"(and LLM_PROVIDER={settings.llm_provider}) to enable LLM patch generation."
                 ),
             },
-            "reproduction_test_code": "def test_stub():\n    assert True\n",
+            "reproduction_test_code": stub_suite,
             "retry_count": retry,
         }
     else:
@@ -241,18 +248,18 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
                     data = {
                         "root_cause_analysis": content,
                         "proposed_patch": {},
-                        "reproduction_test_code": "def test_stub():\n    assert False\n",
+                        "reproduction_test_code": stub_suite,
                     }
             else:
                 data = {
                     "root_cause_analysis": content,
                     "proposed_patch": {},
-                    "reproduction_test_code": "def test_stub():\n    assert False\n",
+                    "reproduction_test_code": stub_suite,
                 }
         out = {
             "root_cause_analysis": data.get("root_cause_analysis", content),
             "proposed_patch": data.get("proposed_patch", {}),
-            "reproduction_test_code": data.get("reproduction_test_code", ""),
+            "reproduction_test_code": data.get("reproduction_test_code") or stub_suite,
             "retry_count": retry,
         }
 
@@ -274,7 +281,9 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
 
 
 def execute_test_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
-    code = state.get("reproduction_test_code") or "def test_stub():\n    assert True\n"
+    code = state.get("reproduction_test_code") or (
+        '[{"method": "GET", "path": "/health", "expect_status": 200}]'
+    )
     try:
         mcp = get_mcp_client()
         result = mcp.call_tool(

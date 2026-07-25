@@ -186,7 +186,13 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
 
 @mcp.tool()
 def run_reproduction_test_tool(test_code: str, timeout_seconds: int = 30) -> dict[str, Any]:
-    """Execute a generated pytest snippet against the project sandbox."""
+    """Run reproduction tests in-process via httpx.ASGITransport (no pytest subprocess).
+
+    Accepts either:
+    - Python module text with async/sync `test_*` functions (optional `client` arg =
+      httpx.AsyncClient bound to the target FastAPI app), or
+    - JSON suite: `[{"method":"GET","path":"/health","expect_status":200}, ...]`
+    """
     return run_reproduction_test(test_code, timeout_seconds=timeout_seconds)
 
 

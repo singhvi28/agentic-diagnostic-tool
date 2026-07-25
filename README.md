@@ -97,11 +97,12 @@ Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING
 | Tool | `run_static_analyzers` | Plugin analyzer suite |
 | Tool | `search_similar_bugs` | pgvector similarity |
 | Tool | `hybrid_root_cause_analysis` | pgvector + Neo4j context |
-| Tool | `run_reproduction_test_tool` | Execute generated pytest |
+| Tool | `run_reproduction_test_tool` | In-process ASGI tests (JSON suite or `test_*`) |
 
 ## Notes
 
 - LangGraph retrieve/fetch/execute nodes call MCP tools via `DiagnosticMcpClient` (stdio/HTTP); session DB + LLM diagnose stay local.
+- Reproduction tests run **in-process** via `httpx.ASGITransport` (JSON HTTP suite or Python `test_*` with injected `client`) — no pytest tempfile subprocess.
 - Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Use `openai` or `gemini` for real embeddings.
 - Without the active provider’s API key, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
 - Cursor provider uses the Cursor SDK (`Agent.prompt` + Composer 2.5) and asks for JSON-only output without file edits.
