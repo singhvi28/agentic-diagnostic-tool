@@ -50,10 +50,23 @@ src/diagnostic_engine/
   memory/       # Neo4j + PgVectorMemory + ingest CLI
   mcp/          # FastMCP server (tools + resources)
   agent/        # LangGraph state machine + CLI + apply_patch
+  llm/          # OpenAI / Gemini / Cursor LLM clients
 alembic/        # migrations
 examples/target_app/   # intentionally buggy FastAPI app
 logs/app_errors.log    # sample tracebacks
 ```
+
+## LLM providers
+
+Set `LLM_PROVIDER` and the matching API key in `.env`:
+
+| Provider | Env key | Default model |
+|----------|---------|---------------|
+| `openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-3-flash-preview` |
+| `cursor` | `CURSOR_API_KEY` | `composer-2.5` |
+
+Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING_PROVIDER=hash|openai|gemini`.
 
 ## MCP surface
 
@@ -72,7 +85,8 @@ logs/app_errors.log    # sample tracebacks
 
 ## Notes
 
-- Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Set `openai` + `OPENAI_API_KEY` for real embeddings.
-- Without `OPENAI_API_KEY`, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
+- Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Use `openai` or `gemini` for real embeddings.
+- Without the active provider’s API key, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
+- Cursor provider uses the Cursor SDK (`Agent.prompt` + Composer 2.5) and asks for JSON-only output without file edits.
 - `--apply` writes full-file patch contents only (not unified diffs), with backups under `patches/{session_id}/`.
 - Sample bugs in `examples/target_app`: blocking `time.sleep` in async handler, DI yield without `try/finally`, unhandled index error → 500.

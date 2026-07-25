@@ -39,11 +39,35 @@ def openai_embed(text: str, *, dim: int, api_key: str) -> list[float]:
     return vector[:dim]
 
 
+def gemini_embed(text: str, *, dim: int, api_key: str) -> list[float]:
+    """Embed via Gemini text-embedding-004, truncated/padded to `dim`."""
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.embed_content(
+        model="text-embedding-004",
+        contents=text,
+    )
+    # google-genai returns .embeddings[0].values or .embedding.values depending on version
+    values: list[float]
+    if hasattr(response, "embeddings") and response.embeddings:
+        values = list(response.embeddings[0].values)
+    elif hasattr(response, "embedding") and response.embedding is not None:
+        values = list(response.embedding.values)
+    else:
+        raise RuntimeError(f"Unexpected Gemini embed response: {response!r}")
+    if len(values) < dim:
+        values = values + [0.0] * (dim - len(values))
+    return values[:dim]
+
+
 def embed_text(text: str, settings: Settings | None = None) -> list[float]:
     settings = settings or get_settings()
     dim = settings.embedding_dim
     if settings.embedding_provider == "openai" and settings.openai_api_key:
         return openai_embed(text, dim=dim, api_key=settings.openai_api_key)
+    if settings.embedding_provider == "gemini" and settings.gemini_api_key:
+        return gemini_embed(text, dim=dim, api_key=settings.gemini_api_key)
     return hash_embed(text, dim=dim)
 
 

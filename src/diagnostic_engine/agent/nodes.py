@@ -6,9 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-
 from diagnostic_engine.agent.apply_patch import apply_patches
 from diagnostic_engine.agent.state import FastAPIDiagnosticState
 from diagnostic_engine.analysis.asgi_runner import run_reproduction_test
@@ -150,50 +147,63 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     settings = get_settings()
     retry = state.get("retry_count", 0) + 1
 
-    if not settings.openai_api_key:
+    system = (
+        "You diagnose FastAPI bugs (async blocking, Pydantic 500s, "
+        "Depends yield without finally, lifespan leaks). Return valid JSON only."
+    )
+    prompt = (
+        f"Traceback:\n{state.get('raw_log_entry')}\n\n"
+        f"Graph Context:\n{json.dumps(state.get('dependency_graph'), default=str)}\n\n"
+        f"Historical cases:\n{json.dumps(state.get('historical_cases'), default=str)}\n\n"
+        f"Snippets:\n{json.dumps(state.get('source_code_snippets'), default=str)}\n\n"
+        f"Analyzer findings:\n{json.dumps(state.get('analyzer_findings'), default=str)}\n\n"
+        f"Previous Test Result:\n{json.dumps(state.get('test_result'), default=str)}\n\n"
+        "Respond as JSON with keys: root_cause_analysis (str), "
+        "proposed_patch (object mapping filename -> full new file content), "
+        "reproduction_test_code (pytest using httpx.ASGITransport against examples.target_app.main:app)."
+    )
+
+    if not settings.has_llm_credentials():
         out = {
             "root_cause_analysis": (
-                "OPENAI_API_KEY not set — stub RCA. "
+                f"No API key for llm_provider={settings.llm_provider!r} — stub RCA. "
                 f"Analyzer findings: {json.dumps(state.get('analyzer_findings') or [], default=str)[:2000]}"
             ),
             "proposed_patch": {
-                "note": "Set OPENAI_API_KEY to enable LLM patch generation.",
+                "note": (
+                    "Set OPENAI_API_KEY, GEMINI_API_KEY, or CURSOR_API_KEY "
+                    f"(and LLM_PROVIDER={settings.llm_provider}) to enable LLM patch generation."
+                ),
             },
             "reproduction_test_code": "def test_stub():\n    assert True\n",
             "retry_count": retry,
         }
     else:
-        llm = ChatOpenAI(model=settings.llm_model, temperature=0, api_key=settings.openai_api_key)
-        prompt = (
-            f"Traceback:\n{state.get('raw_log_entry')}\n\n"
-            f"Graph Context:\n{json.dumps(state.get('dependency_graph'), default=str)}\n\n"
-            f"Historical cases:\n{json.dumps(state.get('historical_cases'), default=str)}\n\n"
-            f"Snippets:\n{json.dumps(state.get('source_code_snippets'), default=str)}\n\n"
-            f"Analyzer findings:\n{json.dumps(state.get('analyzer_findings'), default=str)}\n\n"
-            f"Previous Test Result:\n{json.dumps(state.get('test_result'), default=str)}\n\n"
-            "Respond as JSON with keys: root_cause_analysis (str), "
-            "proposed_patch (object mapping filename -> full new file content), "
-            "reproduction_test_code (pytest using httpx.ASGITransport against examples.target_app.main:app)."
-        )
-        response = llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You diagnose FastAPI bugs (async blocking, Pydantic 500s, "
-                        "Depends yield without finally, lifespan leaks). Return valid JSON only."
-                    )
-                ),
-                HumanMessage(content=prompt),
-            ]
-        )
-        content = response.content if isinstance(response.content, str) else str(response.content)
+        from diagnostic_engine.llm import MissingCredentialsError, get_llm_client
+
+        try:
+            client = get_llm_client(settings)
+            response = client.complete(system=system, user=prompt)
+            content = response.content
+        except MissingCredentialsError as exc:
+            content = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            content = f"LLM provider error ({settings.llm_provider}): {exc}"
+
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
             start = content.find("{")
             end = content.rfind("}")
             if start >= 0 and end > start:
-                data = json.loads(content[start : end + 1])
+                try:
+                    data = json.loads(content[start : end + 1])
+                except json.JSONDecodeError:
+                    data = {
+                        "root_cause_analysis": content,
+                        "proposed_patch": {},
+                        "reproduction_test_code": "def test_stub():\n    assert False\n",
+                    }
             else:
                 data = {
                     "root_cause_analysis": content,
