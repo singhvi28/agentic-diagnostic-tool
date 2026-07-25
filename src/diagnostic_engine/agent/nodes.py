@@ -7,15 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from diagnostic_engine.agent.apply_patch import apply_patches
+from diagnostic_engine.agent.mcp_client import get_mcp_client
 from diagnostic_engine.agent.state import FastAPIDiagnosticState
-from diagnostic_engine.analysis.asgi_runner import run_reproduction_test
-from diagnostic_engine.analysis.code_reader import read_source_file
 from diagnostic_engine.analysis.traceback_parser import parse_traceback
-from diagnostic_engine.analyzers.scanner import run_analyzers
 from diagnostic_engine.config import get_settings
 from diagnostic_engine.db import repository as repo
-from diagnostic_engine.memory.neo4j_client import Neo4jMemory
-from diagnostic_engine.memory.pgvector_client import PgVectorMemory
 
 
 def _safe_event(session_id: str | None, node: str, payload: dict[str, Any]) -> None:
@@ -25,6 +21,34 @@ def _safe_event(session_id: str | None, node: str, payload: dict[str, Any]) -> N
         repo.append_event(session_id, node, payload)
     except Exception:
         pass
+
+
+def _sandbox_relative_path(filename: str, sandbox_root: Path) -> str:
+    """Map a traceback path to a path relative to sandbox_root for MCP read_code."""
+    sandbox = sandbox_root.resolve()
+    raw = Path(filename)
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((sandbox / raw).resolve())
+        # Strip leading sandbox-relative prefix from cwd-style paths
+        # e.g. examples/target_app/main.py when sandbox is .../examples/target_app
+        parts = raw.parts
+        sandbox_name = sandbox.name
+        if sandbox_name in parts:
+            idx = parts.index(sandbox_name)
+            candidates.append((sandbox / Path(*parts[idx + 1 :])).resolve())
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_relative_to(sandbox):
+                return str(candidate.relative_to(sandbox))
+        except (ValueError, OSError):
+            continue
+    # Last resort: basename under sandbox
+    return raw.name
 
 
 def parse_log_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
@@ -62,28 +86,23 @@ def parse_log_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
 
 
 def retrieve_graphrag_context_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
-    settings = get_settings()
     raw = state.get("raw_log_entry", "")
     historical: list[dict[str, Any]] = []
     graph: list[dict[str, Any]] = []
 
-    pg = PgVectorMemory(settings)
     try:
-        if pg.ping():
-            historical = pg.query_similar(raw, top_k=3)
+        mcp = get_mcp_client()
+        result = mcp.call_tool(
+            "hybrid_root_cause_analysis",
+            {"traceback_text": raw},
+        )
+        if isinstance(result, dict):
+            historical = result.get("similar_bugs") or []
+            graph = result.get("dependency_graph") or []
+        else:
+            historical = [{"error": f"unexpected MCP payload: {result!r}"}]
     except Exception as exc:  # noqa: BLE001
         historical = [{"error": str(exc)}]
-
-    parsed = state.get("parsed_traceback")
-    seed = parsed.failing_frame.function_name if parsed and parsed.failing_frame else None
-    neo = Neo4jMemory(settings)
-    try:
-        if seed and neo.ping():
-            graph = neo.traverse_from_function(seed, hops=3)
-    except Exception as exc:  # noqa: BLE001
-        graph = [{"error": str(exc)}]
-    finally:
-        neo.close()
 
     out = {"historical_cases": historical, "dependency_graph": graph}
     _safe_event(state.get("session_id"), "retrieve_context", {
@@ -102,38 +121,58 @@ def fetch_source_code_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     target_file: str | None = None
     target_fn: str | None = None
 
+    mcp = get_mcp_client()
+
     if parsed and parsed.failing_frame:
         frame = parsed.failing_frame
         target_fn = frame.function_name
         try:
-            file_path = frame.filename
-            sandbox = settings.sandbox_root.resolve()
-            abs_frame = Path(file_path)
-            if abs_frame.is_absolute() and abs_frame.resolve().is_relative_to(sandbox):
-                file_path = str(abs_frame.resolve().relative_to(sandbox))
-            elif not abs_frame.is_absolute():
-                file_path = frame.filename
-
+            file_path = _sandbox_relative_path(frame.filename, settings.sandbox_root)
             start = max(1, frame.line_number - 15)
             end = frame.line_number + 15
-            result = read_source_file(file_path, settings.sandbox_root, start, end)
-            snippets[result["file"]] = result["content"]
-            target_file = result["file"]
-            from diagnostic_engine.analysis.async_blocking import analyze_async_blocking
+            result = mcp.call_tool(
+                "read_code",
+                {
+                    "file_path": file_path,
+                    "start_line": start,
+                    "end_line": end,
+                },
+            )
+            if isinstance(result, dict):
+                snippets[result.get("file", file_path)] = result.get("content", "")
+                target_file = result.get("file", file_path)
+            else:
+                snippets["error"] = f"unexpected read_code payload: {result!r}"
 
-            findings = analyze_async_blocking(Path(result["file"]), frame.function_name)
+            if target_file and target_fn:
+                # Prefer sandbox-relative path for AST tool
+                ast_path = file_path
+                findings = mcp.call_tool(
+                    "analyze_ast_for_async_blocking",
+                    {"file_path": ast_path, "function_name": target_fn},
+                )
+                if not isinstance(findings, dict):
+                    findings = {"raw": findings}
         except Exception as exc:  # noqa: BLE001
             snippets["error"] = str(exc)
 
-    analyzer_findings = run_analyzers(
-        root=settings.target_app_root,
-        file_path=target_file,
-        function_name=target_fn,
-    )
+    try:
+        args: dict[str, Any] = {}
+        if target_file:
+            args["file_path"] = target_file
+        if target_fn:
+            args["function_name"] = target_fn
+        scan = mcp.call_tool("run_static_analyzers", args)
+        if isinstance(scan, dict):
+            analyzer_findings = scan.get("findings") or []
+        else:
+            analyzer_findings = [{"error": f"unexpected analyzers payload: {scan!r}"}]
+    except Exception as exc:  # noqa: BLE001
+        analyzer_findings = [{"error": str(exc)}]
 
     out = {
         "source_code_snippets": snippets,
-        "ast_findings": findings,
+        "ast_findings": findings if isinstance(findings, dict) else {},
         "analyzer_findings": analyzer_findings,
     }
     _safe_event(state.get("session_id"), "fetch_source", {
@@ -236,7 +275,17 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
 
 def execute_test_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     code = state.get("reproduction_test_code") or "def test_stub():\n    assert True\n"
-    result = run_reproduction_test(code)
+    try:
+        mcp = get_mcp_client()
+        result = mcp.call_tool(
+            "run_reproduction_test_tool",
+            {"test_code": code},
+        )
+        if not isinstance(result, dict):
+            result = {"passed": False, "error": f"unexpected test payload: {result!r}"}
+    except Exception as exc:  # noqa: BLE001
+        result = {"passed": False, "error": str(exc)}
+
     session_id = state.get("session_id")
     if session_id:
         try:

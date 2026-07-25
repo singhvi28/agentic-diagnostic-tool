@@ -191,7 +191,29 @@ def run_reproduction_test_tool(test_code: str, timeout_seconds: int = 30) -> dic
 
 
 def main() -> None:
-    mcp.run()
+    """Run the MCP server (stdio by default; HTTP when MCP_TRANSPORT=http)."""
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="FastAPI Diagnostic MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=None,
+        help="Override MCP_TRANSPORT (stdio|http)",
+    )
+    parser.add_argument("--host", default=None, help="HTTP bind host")
+    parser.add_argument("--port", type=int, default=None, help="HTTP bind port")
+    args = parser.parse_args()
+
+    settings = get_settings()
+    transport = args.transport or os.environ.get("MCP_TRANSPORT") or settings.mcp_transport
+    if transport == "http":
+        host = args.host or settings.mcp_http_host
+        port = args.port or settings.mcp_http_port
+        mcp.run(transport="http", host=host, port=port, path="/mcp")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

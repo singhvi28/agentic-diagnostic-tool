@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LLMProvider = Literal["openai", "gemini", "cursor"]
 EmbeddingProvider = Literal["hash", "openai", "gemini"]
+McpTransport = Literal["stdio", "http", "inprocess"]
 
 
 class Settings(BaseSettings):
@@ -44,6 +45,14 @@ class Settings(BaseSettings):
     embedding_provider: EmbeddingProvider = "hash"
 
     max_retries: int = 3
+
+    # LangGraph → FastMCP transport
+    # stdio: agent spawns diagnostic-mcp; http: connect to MCP_URL; inprocess: tests only
+    mcp_transport: McpTransport = "stdio"
+    mcp_url: str = "http://127.0.0.1:8000/mcp"
+    mcp_stdio_command: str = "diagnostic-mcp"
+    mcp_http_host: str = "127.0.0.1"
+    mcp_http_port: int = 8000
 
     def resolved_llm_model(self) -> str:
         if self.llm_model:

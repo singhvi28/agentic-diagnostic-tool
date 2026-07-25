@@ -24,15 +24,31 @@ diagnostic-ingest
 # 4. Unit tests
 pytest -q
 
-# 5. Start the MCP tool server
-diagnostic-mcp
-
-# 6. Run the diagnostic agent over the sample error log
+# 5. Run the diagnostic agent (spawns MCP over stdio by default)
 diagnostic-agent --log logs/app_errors.log
 
 # Optional: apply proposed full-file patches after tests pass
 diagnostic-agent --log logs/app_errors.log --apply
 ```
+
+### LangGraph ↔ MCP transport
+
+LangGraph nodes call FastMCP tools over the wire (not via direct Python imports).
+
+```bash
+# A) one-shot — agent spawns diagnostic-mcp via stdio (default)
+MCP_TRANSPORT=stdio diagnostic-agent --log logs/app_errors.log
+
+# B) split processes — long-lived HTTP MCP server
+diagnostic-mcp --transport http --host 127.0.0.1 --port 8000
+MCP_TRANSPORT=http MCP_URL=http://127.0.0.1:8000/mcp diagnostic-agent --log logs/app_errors.log
+```
+
+| Env | Meaning |
+|-----|---------|
+| `MCP_TRANSPORT` | `stdio` (default), `http`, or `inprocess` (tests) |
+| `MCP_URL` | Streamable HTTP endpoint when transport is `http` |
+| `MCP_STDIO_COMMAND` | Command the agent spawns for stdio (default `diagnostic-mcp`) |
 
 Optional: run the target app to generate live errors:
 
@@ -49,7 +65,7 @@ src/diagnostic_engine/
   db/           # SQLAlchemy models, sessions, patches, pgvector rows
   memory/       # Neo4j + PgVectorMemory + ingest CLI
   mcp/          # FastMCP server (tools + resources)
-  agent/        # LangGraph state machine + CLI + apply_patch
+  agent/        # LangGraph + MCP client facade + CLI + apply_patch
   llm/          # OpenAI / Gemini / Cursor LLM clients
 alembic/        # migrations
 examples/target_app/   # intentionally buggy FastAPI app
@@ -85,6 +101,7 @@ Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING
 
 ## Notes
 
+- LangGraph retrieve/fetch/execute nodes call MCP tools via `DiagnosticMcpClient` (stdio/HTTP); session DB + LLM diagnose stay local.
 - Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Use `openai` or `gemini` for real embeddings.
 - Without the active provider’s API key, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
 - Cursor provider uses the Cursor SDK (`Agent.prompt` + Composer 2.5) and asks for JSON-only output without file edits.

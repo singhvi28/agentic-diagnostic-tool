@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from diagnostic_engine.agent.graph import get_agent
+from diagnostic_engine.agent.mcp_client import DiagnosticMcpClient
 from diagnostic_engine.config import get_settings
 
 
@@ -39,7 +40,8 @@ def main() -> None:
         raw = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
 
     agent = get_agent()
-    final = agent.invoke({"raw_log_entry": raw, "apply_patches": bool(args.apply)})
+    with DiagnosticMcpClient.from_settings(settings) as _mcp:
+        final = agent.invoke({"raw_log_entry": raw, "apply_patches": bool(args.apply)})
 
     out = dict(final)
     parsed = out.get("parsed_traceback")
@@ -68,6 +70,7 @@ def main() -> None:
         "apply_result": out.get("apply_result"),
         "root_cause_analysis": out.get("root_cause_analysis"),
         "analyzer_findings": out.get("analyzer_findings"),
+        "mcp_transport": settings.mcp_transport,
     }
     print(json.dumps({"summary": summary, "state": out}, indent=2, default=str))
 
