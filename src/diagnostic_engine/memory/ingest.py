@@ -1,4 +1,4 @@
-"""Ingest target FastAPI app topology into Neo4j (+ seed Qdrant from error logs)."""
+"""Ingest target FastAPI app topology into Neo4j (+ seed pgvector from error logs)."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import argparse
 from pathlib import Path
 
 from diagnostic_engine.analysis.fastapi_routes import extract_fastapi_topology
+from diagnostic_engine.analysis.traceback_parser import parse_traceback
 from diagnostic_engine.config import get_settings
 from diagnostic_engine.memory.neo4j_client import Neo4jMemory
-from diagnostic_engine.memory.qdrant_client import QdrantMemory
+from diagnostic_engine.memory.pgvector_client import PgVectorMemory
 
 
 def ingest(root: Path | None = None) -> dict:
@@ -17,22 +18,44 @@ def ingest(root: Path | None = None) -> dict:
 
     topology = extract_fastapi_topology(app_root)
     neo = Neo4jMemory(settings)
-    neo.ensure_constraints()
-    counts = neo.upsert_topology(topology)
-    neo.close()
+    neo_counts: dict = {"routes": 0, "dependencies": 0, "skipped": True}
+    try:
+        if neo.ping():
+            neo.ensure_constraints()
+            neo_counts = neo.upsert_topology(topology)
+            neo_counts["skipped"] = False
+    except Exception as exc:  # noqa: BLE001
+        neo_counts = {"error": str(exc)}
+    finally:
+        neo.close()
 
-    qdrant = QdrantMemory(settings)
-    qdrant.ensure_collection()
+    pg = PgVectorMemory(settings)
     seeded = 0
-    log_path = settings.error_log_path
-    if log_path.exists():
-        # Seed each traceback chunk separated by blank lines
-        chunks = [c.strip() for c in log_path.read_text(encoding="utf-8").split("\n\n") if c.strip()]
-        for chunk in chunks:
-            qdrant.upsert_log(chunk, metadata={"source": str(log_path)})
-            seeded += 1
+    try:
+        if pg.ping():
+            pg.ensure_schema()
+            log_path = settings.error_log_path
+            if log_path.exists():
+                chunks = [
+                    c.strip()
+                    for c in log_path.read_text(encoding="utf-8").split("\n\n")
+                    if c.strip()
+                ]
+                for chunk in chunks:
+                    parsed = parse_traceback(chunk)
+                    meta = {
+                        "source": str(log_path),
+                        "exception_type": parsed.exception_type,
+                        "function_name": (
+                            parsed.failing_frame.function_name if parsed.failing_frame else None
+                        ),
+                    }
+                    pg.upsert_log(chunk, metadata=meta)
+                    seeded += 1
+    except Exception as exc:  # noqa: BLE001
+        return {"neo4j": neo_counts, "pgvector_seeded": seeded, "pgvector_error": str(exc), "root": str(app_root)}
 
-    return {"neo4j": counts, "qdrant_seeded": seeded, "root": str(app_root)}
+    return {"neo4j": neo_counts, "pgvector_seeded": seeded, "root": str(app_root)}
 
 
 def main() -> None:

@@ -5,10 +5,12 @@ from __future__ import annotations
 from langgraph.graph import END, StateGraph
 
 from diagnostic_engine.agent.nodes import (
+    apply_patch_node,
     diagnose_and_patch_node,
     evaluate_test_router,
     execute_test_node,
     fetch_source_code_node,
+    finalize_session_node,
     parse_log_node,
     retrieve_graphrag_context_node,
 )
@@ -22,6 +24,8 @@ def build_diagnostic_agent():
     builder.add_node("fetch_source", fetch_source_code_node)
     builder.add_node("diagnose_and_patch", diagnose_and_patch_node)
     builder.add_node("execute_test", execute_test_node)
+    builder.add_node("apply_patch", apply_patch_node)
+    builder.add_node("finalize", finalize_session_node)
 
     builder.set_entry_point("parse_log")
     builder.add_edge("parse_log", "retrieve_context")
@@ -32,11 +36,13 @@ def build_diagnostic_agent():
         "execute_test",
         evaluate_test_router,
         {
-            "passed": END,
+            "passed": "apply_patch",
             "retry": "diagnose_and_patch",
-            "max_retries_reached": END,
+            "max_retries_reached": "finalize",
         },
     )
+    builder.add_edge("apply_patch", "finalize")
+    builder.add_edge("finalize", END)
     return builder.compile()
 
 

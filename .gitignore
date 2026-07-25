@@ -13,6 +13,8 @@ venv/
 .mypy_cache/
 logs/*.log
 !logs/.gitkeep
+patches/
+!patches/.gitkeep
 .coverage
 htmlcov/
 .idea/

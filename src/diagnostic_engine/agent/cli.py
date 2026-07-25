@@ -24,6 +24,11 @@ def main() -> None:
         default=None,
         help="Inline traceback text instead of a log file",
     )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply proposed patches to the sandbox after tests pass",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -34,9 +39,8 @@ def main() -> None:
         raw = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
 
     agent = get_agent()
-    final = agent.invoke({"raw_log_entry": raw})
+    final = agent.invoke({"raw_log_entry": raw, "apply_patches": bool(args.apply)})
 
-    # Make dataclasses JSON-serializable for CLI output
     out = dict(final)
     parsed = out.get("parsed_traceback")
     if parsed is not None and hasattr(parsed, "__dict__"):
@@ -56,7 +60,16 @@ def main() -> None:
             ),
             "frame_count": len(parsed.full_frames),
         }
-    print(json.dumps(out, indent=2, default=str))
+
+    summary = {
+        "session_id": out.get("session_id"),
+        "retry_count": out.get("retry_count"),
+        "test_passed": (out.get("test_result") or {}).get("passed"),
+        "apply_result": out.get("apply_result"),
+        "root_cause_analysis": out.get("root_cause_analysis"),
+        "analyzer_findings": out.get("analyzer_findings"),
+    }
+    print(json.dumps({"summary": summary, "state": out}, indent=2, default=str))
 
 
 if __name__ == "__main__":

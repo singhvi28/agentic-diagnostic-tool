@@ -2,25 +2,26 @@
 
 Autonomous root-cause analysis (RCA) and remediation for FastAPI apps, using:
 
-1. **Memory (GraphRAG)** — Neo4j for code topology, Qdrant for semantic log search  
+1. **Memory (GraphRAG)** — Neo4j for code topology; Postgres + pgvector for sessions, patch history, and semantic log search  
 2. **Tools (FastMCP)** — AST checks, sandboxed code reads, hybrid RCA, test runner  
-3. **Orchestration (LangGraph)** — parse → retrieve → diagnose/patch → test → retry  
+3. **Orchestration (LangGraph)** — parse → retrieve → diagnose/patch → test → optional apply → finalize  
 
 ## Quick start
 
 ```bash
 # 1. Python env
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
 
-# 2. GraphRAG backends
+# 2. Backends (Neo4j + Postgres/pgvector). Postgres is mapped to host port 5433.
 docker compose up -d
+alembic upgrade head
 
-# 3. Ingest the sample buggy app into Neo4j (+ seed Qdrant from logs)
+# 3. Ingest the sample buggy app into Neo4j (+ seed pgvector from logs)
 diagnostic-ingest
 
-# 4. Run unit tests (no LLM / DBs required for analysis helpers)
+# 4. Unit tests
 pytest -q
 
 # 5. Start the MCP tool server
@@ -28,6 +29,9 @@ diagnostic-mcp
 
 # 6. Run the diagnostic agent over the sample error log
 diagnostic-agent --log logs/app_errors.log
+
+# Optional: apply proposed full-file patches after tests pass
+diagnostic-agent --log logs/app_errors.log --apply
 ```
 
 Optional: run the target app to generate live errors:
@@ -40,10 +44,13 @@ uvicorn examples.target_app.main:app --reload --port 8001
 
 ```text
 src/diagnostic_engine/
-  analysis/     # traceback parser, async-blocking AST, FastAPI route extraction
-  memory/       # Neo4j + Qdrant clients, ingest CLI
+  analysis/     # traceback, async-blocking AST, FastAPI routes, ASGI runner
+  analyzers/    # plugin findings (FASTAPI-001 / DI / validation)
+  db/           # SQLAlchemy models, sessions, patches, pgvector rows
+  memory/       # Neo4j + PgVectorMemory + ingest CLI
   mcp/          # FastMCP server (tools + resources)
-  agent/        # LangGraph state machine + CLI
+  agent/        # LangGraph state machine + CLI + apply_patch
+alembic/        # migrations
 examples/target_app/   # intentionally buggy FastAPI app
 logs/app_errors.log    # sample tracebacks
 ```
@@ -54,13 +61,18 @@ logs/app_errors.log    # sample tracebacks
 |------|------------|---------|
 | Resource | `logs://runtime/errors` | Tail of error log |
 | Resource | `routes://app/endpoints` | Static FastAPI topology |
+| Resource | `sessions://recent` | Recent diagnostic sessions |
+| Resource | `sessions://{session_id}` | Session events + patches |
 | Tool | `read_code` | Sandboxed source slices |
 | Tool | `analyze_ast_for_async_blocking` | Sync I/O inside `async def` |
-| Tool | `hybrid_root_cause_analysis` | Qdrant + Neo4j context |
-| Tool | `run_reproduction_test` | Execute generated pytest |
+| Tool | `run_static_analyzers` | Plugin analyzer suite |
+| Tool | `search_similar_bugs` | pgvector similarity |
+| Tool | `hybrid_root_cause_analysis` | pgvector + Neo4j context |
+| Tool | `run_reproduction_test_tool` | Execute generated pytest |
 
 ## Notes
 
-- Qdrant uses a deterministic hash embedding for offline/dev; swap in a real model for production.
-- Without `OPENAI_API_KEY`, the diagnose/patch node returns a stub RCA so the graph still runs.
+- Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Set `openai` + `OPENAI_API_KEY` for real embeddings.
+- Without `OPENAI_API_KEY`, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
+- `--apply` writes full-file patch contents only (not unified diffs), with backups under `patches/{session_id}/`.
 - Sample bugs in `examples/target_app`: blocking `time.sleep` in async handler, DI yield without `try/finally`, unhandled index error → 500.

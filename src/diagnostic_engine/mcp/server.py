@@ -3,21 +3,43 @@
 from __future__ import annotations
 
 import json
-import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
+from diagnostic_engine.analysis.asgi_runner import run_reproduction_test
 from diagnostic_engine.analysis.async_blocking import analyze_async_blocking
 from diagnostic_engine.analysis.code_reader import read_source_file
 from diagnostic_engine.analysis.fastapi_routes import extract_fastapi_topology
 from diagnostic_engine.analysis.traceback_parser import parse_traceback
+from diagnostic_engine.analyzers.scanner import run_analyzers
 from diagnostic_engine.config import get_settings
+from diagnostic_engine.db import repository as repo
+from diagnostic_engine.db.session import get_engine, reset_engine
 from diagnostic_engine.memory.neo4j_client import Neo4jMemory
-from diagnostic_engine.memory.qdrant_client import QdrantMemory
+from diagnostic_engine.memory.pgvector_client import PgVectorMemory
 
-mcp = FastMCP("FastAPI-Diagnostic-Engine")
+
+@asynccontextmanager
+async def diagnostic_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
+    settings = get_settings()
+    engine = get_engine(settings)
+    neo = Neo4jMemory(settings)
+    try:
+        yield {"engine": engine, "neo4j": neo, "settings": settings}
+    finally:
+        neo.close()
+        reset_engine()
+
+
+mcp = FastMCP(
+    "FastAPI-Diagnostic-Engine",
+    lifespan=diagnostic_lifespan,
+    instructions="Root-cause analysis tools for FastAPI applications.",
+)
 
 
 @mcp.resource("logs://runtime/errors")
@@ -37,6 +59,27 @@ def get_route_map() -> str:
     settings = get_settings()
     topology = extract_fastapi_topology(settings.target_app_root)
     return json.dumps(topology, indent=2)
+
+
+@mcp.resource("sessions://recent")
+def get_recent_sessions() -> str:
+    """List recent diagnostic sessions."""
+    try:
+        return json.dumps(repo.list_recent_sessions(20), indent=2, default=str)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.resource("sessions://{session_id}")
+def get_session_detail(session_id: str) -> str:
+    """Return session events and patch history."""
+    try:
+        data = repo.get_session(session_id)
+        if data is None:
+            return json.dumps({"error": "session not found", "session_id": session_id})
+        return json.dumps(data, indent=2, default=str)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": str(exc), "session_id": session_id})
 
 
 @mcp.tool()
@@ -66,20 +109,45 @@ def analyze_ast_for_async_blocking(file_path: str, function_name: str) -> dict[s
 
 
 @mcp.tool()
+def run_static_analyzers(file_path: str | None = None, function_name: str | None = None) -> dict[str, Any]:
+    """Run deterministic FastAPI analyzers (async blocking, DI rollback, validation)."""
+    settings = get_settings()
+    findings = run_analyzers(
+        root=settings.target_app_root,
+        file_path=file_path,
+        function_name=function_name,
+    )
+    return {"findings": findings, "count": len(findings)}
+
+
+@mcp.tool()
+def search_similar_bugs(traceback_text: str, top_k: int = 3) -> dict[str, Any]:
+    """Semantic search over past logs/tracebacks in Postgres pgvector."""
+    settings = get_settings()
+    pg = PgVectorMemory(settings)
+    try:
+        if not pg.ping():
+            return {"results": [], "error": "Postgres unavailable"}
+        return {"results": pg.query_similar(traceback_text, top_k=top_k)}
+    except Exception as exc:  # noqa: BLE001
+        return {"results": [], "error": str(exc)}
+
+
+@mcp.tool()
 def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
-    """Combine Qdrant vector search and Neo4j graph traversal for RCA context."""
+    """Combine pgvector similarity search and Neo4j graph traversal for RCA context."""
     settings = get_settings()
     parsed = parse_traceback(traceback_text)
 
     similar_logs: list[dict[str, Any]] = []
     graph_context: list[dict[str, Any]] = []
 
-    qdrant = QdrantMemory(settings)
+    pg = PgVectorMemory(settings)
     try:
-        if qdrant.ping():
-            similar_logs = qdrant.query_similar(traceback_text, top_k=3)
-    except Exception as exc:  # noqa: BLE001 — soft-fail when store is down
-        similar_logs = [{"error": f"Qdrant unavailable: {exc}"}]
+        if pg.ping():
+            similar_logs = pg.query_similar(traceback_text, top_k=3)
+    except Exception as exc:  # noqa: BLE001
+        similar_logs = [{"error": f"Postgres/pgvector unavailable: {exc}"}]
 
     seed_function = None
     if parsed.failing_frame:
@@ -117,35 +185,9 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def run_reproduction_test(test_code: str, timeout_seconds: int = 30) -> dict[str, Any]:
-    """Write a pytest snippet to a temp file and execute it under the sandbox cwd."""
-    import subprocess
-    import sys
-
-    settings = get_settings()
-    sandbox = settings.sandbox_root.resolve()
-    with tempfile.TemporaryDirectory(prefix="diag_test_") as tmp:
-        test_path = Path(tmp) / "test_reproduction.py"
-        test_path.write_text(test_code, encoding="utf-8")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", str(test_path), "-q", "--tb=short"],
-                cwd=str(sandbox),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            return {
-                "passed": result.returncode == 0,
-                "returncode": result.returncode,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-2000:],
-            }
-        except subprocess.TimeoutExpired:
-            return {"passed": False, "error": f"Timed out after {timeout_seconds}s"}
-        except FileNotFoundError:
-            return {"passed": False, "error": "pytest not installed in this environment"}
+def run_reproduction_test_tool(test_code: str, timeout_seconds: int = 30) -> dict[str, Any]:
+    """Execute a generated pytest snippet against the project sandbox."""
+    return run_reproduction_test(test_code, timeout_seconds=timeout_seconds)
 
 
 def main() -> None:

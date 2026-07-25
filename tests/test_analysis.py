@@ -1,10 +1,11 @@
-"""Unit tests for analysis helpers (no Neo4j/Qdrant required)."""
+"""Unit tests for analysis helpers (no Postgres/Neo4j required)."""
 
 from pathlib import Path
 
 from diagnostic_engine.analysis.async_blocking import analyze_async_blocking
 from diagnostic_engine.analysis.fastapi_routes import extract_fastapi_topology
 from diagnostic_engine.analysis.traceback_parser import parse_traceback
+from diagnostic_engine.analyzers.scanner import run_analyzers
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "examples" / "target_app" / "main.py"
@@ -40,3 +41,14 @@ def test_extract_fastapi_routes():
     get_db = next(d for d in topology["dependencies"] if d["name"] == "get_db")
     assert get_db["is_generator"] is True
     assert get_db["has_try_finally"] is False
+
+
+def test_plugin_analyzers_find_di_and_blocking():
+    findings = run_analyzers(
+        root=TARGET.parent,
+        file_path=TARGET,
+        function_name="checkout",
+    )
+    rule_ids = {f["rule_id"] for f in findings}
+    assert "FASTAPI-001" in rule_ids
+    assert "FASTAPI-DI-001" in rule_ids
