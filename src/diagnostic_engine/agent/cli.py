@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import warnings
 from pathlib import Path
 
 from diagnostic_engine.agent.graph import get_agent
 from diagnostic_engine.agent.mcp_client import DiagnosticMcpClient
 from diagnostic_engine.config import get_settings
+
+_APPLY_DISABLED_MSG = (
+    "--apply is temporarily disabled: the agent writes full LLM file contents "
+    "(not unified diffs) with only a backup, and there is no review/AST gate. "
+    "Proceeding without applying patches. Inspect proposed_patch in the output instead."
+)
 
 
 def main() -> None:
@@ -28,9 +36,17 @@ def main() -> None:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Apply proposed patches to the sandbox after tests pass",
+        help=(
+            "Temporarily ignored with a warning: would apply proposed patches "
+            "after tests pass (unsafe until diff/review gates land)"
+        ),
     )
     args = parser.parse_args()
+
+    apply_patches = False
+    if args.apply:
+        warnings.warn(_APPLY_DISABLED_MSG, UserWarning, stacklevel=1)
+        print(f"WARNING: {_APPLY_DISABLED_MSG}", file=sys.stderr)
 
     settings = get_settings()
     if args.text:
@@ -41,7 +57,7 @@ def main() -> None:
 
     agent = get_agent()
     with DiagnosticMcpClient.from_settings(settings) as _mcp:
-        final = agent.invoke({"raw_log_entry": raw, "apply_patches": bool(args.apply)})
+        final = agent.invoke({"raw_log_entry": raw, "apply_patches": apply_patches})
 
     out = dict(final)
     parsed = out.get("parsed_traceback")
@@ -71,6 +87,8 @@ def main() -> None:
         "root_cause_analysis": out.get("root_cause_analysis"),
         "analyzer_findings": out.get("analyzer_findings"),
         "mcp_transport": settings.mcp_transport,
+        "apply_requested": bool(args.apply),
+        "apply_patches": apply_patches,
     }
     print(json.dumps({"summary": summary, "state": out}, indent=2, default=str))
 

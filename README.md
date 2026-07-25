@@ -27,9 +27,10 @@ pytest -q
 # 5. Run the diagnostic agent (spawns MCP over stdio by default)
 diagnostic-agent --log logs/app_errors.log
 
-# Optional: apply proposed full-file patches after tests pass
+# --apply is temporarily ignored (warns, then runs without writing patches)
 diagnostic-agent --log logs/app_errors.log --apply
 ```
+
 
 ### LangGraph ↔ MCP transport
 
@@ -106,5 +107,5 @@ Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING
 - Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Use `openai` or `gemini` for real embeddings.
 - Without the active provider’s API key, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
 - Cursor provider uses the Cursor SDK (`Agent.prompt` + Composer 2.5) and asks for JSON-only output without file edits.
-- `--apply` writes full-file patch contents only (not unified diffs), with backups under `patches/{session_id}/`.
+- `--apply` is temporarily disabled: it prints a warning and continues without writing files (full-file LLM patches are unsafe until diff/review gates land).
 - Sample bugs in `examples/target_app`: blocking `time.sleep` in async handler, DI yield without `try/finally`, unhandled index error → 500.
