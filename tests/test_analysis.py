@@ -43,6 +43,24 @@ def test_extract_fastapi_routes():
     assert get_db["has_try_finally"] is False
 
 
+def test_extract_functions_decorators_params_and_depends():
+    topology = extract_fastapi_topology(TARGET.parent)
+    functions = {f["name"]: f for f in topology["functions"]}
+    assert "checkout" in functions
+    assert "get_db" in functions
+    checkout = functions["checkout"]
+    assert any(d.get("is_route") for d in checkout["decorators"])
+    assert "get_db" in checkout["depends_on"] or any(
+        "get_db" in d for d in checkout["depends_on"]
+    )
+    param_names = {p["name"] for p in checkout["params"]}
+    assert "order" in param_names
+    assert "db" in param_names
+    route_dec = next(d for d in checkout["decorators"] if d.get("is_route"))
+    assert route_dec["method"] == "POST"
+    assert route_dec["path"] == "/orders/checkout"
+
+
 def test_plugin_analyzers_find_di_and_blocking():
     findings = run_analyzers(
         root=TARGET.parent,

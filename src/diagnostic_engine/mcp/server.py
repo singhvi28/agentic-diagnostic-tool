@@ -159,8 +159,15 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
     try:
         if seed_function and neo.ping():
             graph_context = neo.traverse_from_function(seed_function, hops=3)
+            try:
+                fragile = neo.fragile_routes()
+            except Exception:  # noqa: BLE001
+                fragile = []
+        else:
+            fragile = []
     except Exception as exc:  # noqa: BLE001
         graph_context = [{"error": f"Neo4j unavailable: {exc}"}]
+        fragile = []
     finally:
         neo.close()
 
@@ -181,6 +188,7 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
         },
         "similar_bugs": similar_logs,
         "dependency_graph": graph_context,
+        "fragile_routes": fragile if seed_function else [],
     }
 
 

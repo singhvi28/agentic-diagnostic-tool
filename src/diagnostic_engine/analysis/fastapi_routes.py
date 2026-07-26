@@ -42,8 +42,33 @@ class RouterMount:
     line: int
 
 
+@dataclass
+class FunctionInfo:
+    name: str
+    qname: str
+    file: str
+    line: int
+    is_async: bool
+    decorators: list[dict[str, Any]] = field(default_factory=list)
+    params: list[dict[str, Any]] = field(default_factory=list)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+
+
+def function_qname(file_path: str, name: str, root: Path | None = None) -> str:
+    """Stable Function identity: relative/file::name."""
+    p = Path(file_path)
+    if root is not None:
+        try:
+            rel = p.resolve().relative_to(Path(root).resolve())
+            return f"{rel.as_posix()}::{name}"
+        except ValueError:
+            pass
+    return f"{p.name}::{name}"
+
+
 def extract_fastapi_topology(root: str | Path) -> dict[str, Any]:
-    """Walk a project tree and extract Endpoint / Dependency candidates for Neo4j."""
+    """Walk a project tree and extract Endpoint / Dependency / Function graph candidates."""
     root_path = Path(root)
     if not root_path.exists():
         raise FileNotFoundError(f"Root not found: {root}")
@@ -51,6 +76,7 @@ def extract_fastapi_topology(root: str | Path) -> dict[str, Any]:
     routes: list[RouteInfo] = []
     dependencies: list[DependencyInfo] = []
     mounts: list[RouterMount] = []
+    functions: list[FunctionInfo] = []
     router_prefixes: dict[str, str] = {}  # var -> prefix from APIRouter(prefix=...)
 
     for py_file in root_path.rglob("*.py"):
@@ -66,6 +92,7 @@ def extract_fastapi_topology(root: str | Path) -> dict[str, Any]:
         mounts.extend(_extract_include_router(tree, str(py_file)))
         routes.extend(_extract_routes(tree, str(py_file)))
         dependencies.extend(_extract_dependencies(tree, str(py_file)))
+        functions.extend(_extract_functions(tree, str(py_file), root_path))
 
     # Compose mount prefixes onto routes by router variable name
     mount_prefix_by_router: dict[str, str] = dict(router_prefixes)
@@ -77,11 +104,105 @@ def extract_fastapi_topology(root: str | Path) -> dict[str, Any]:
         if route.router_var and route.router_var in mount_prefix_by_router:
             route.path = _join_paths(mount_prefix_by_router[route.router_var], route.path)
 
+    # Attach composed route method/path onto matching function decorators
+    route_by_fn: dict[str, RouteInfo] = {r.function_name: r for r in routes}
+    for fn in functions:
+        route = route_by_fn.get(fn.name)
+        if route is None:
+            continue
+        for dec in fn.decorators:
+            if dec.get("is_route"):
+                dec["method"] = route.method
+                dec["path"] = route.path
+
     return {
         "routes": [asdict(r) for r in routes],
         "dependencies": [asdict(d) for d in dependencies],
         "mounts": [asdict(m) for m in mounts],
+        "functions": [asdict(f) for f in functions],
     }
+
+
+def _extract_functions(
+    tree: ast.AST,
+    file_path: str,
+    root: Path,
+) -> list[FunctionInfo]:
+    """Top-level functions with decorators, params, shallow CALLS, and Depends edges."""
+    results: list[FunctionInfo] = []
+    module_body = getattr(tree, "body", [])
+    for node in module_body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators: list[dict[str, Any]] = []
+        for dec in node.decorator_list:
+            raw = ast.unparse(dec)
+            method, path, _router = _route_decorator(dec)
+            decorators.append(
+                {
+                    "raw": raw,
+                    "name": raw.split("(")[0],
+                    "is_route": method is not None,
+                    "method": method.upper() if method else None,
+                    "path": path,
+                    "module": None,
+                }
+            )
+
+        params: list[dict[str, Any]] = []
+        positional = list(node.args.args)
+        defaults = list(node.args.defaults)
+        default_offset = len(positional) - len(defaults)
+        for i, arg in enumerate(positional):
+            if arg.arg in {"self", "cls"}:
+                continue
+            default_val = None
+            if i >= default_offset:
+                default_val = ast.unparse(defaults[i - default_offset])
+            annotation = ast.unparse(arg.annotation) if arg.annotation else None
+            params.append(
+                {
+                    "name": arg.arg,
+                    "annotation": annotation,
+                    "default": default_val,
+                }
+            )
+        for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            params.append(
+                {
+                    "name": arg.arg,
+                    "annotation": ast.unparse(arg.annotation) if arg.annotation else None,
+                    "default": ast.unparse(default) if default is not None else None,
+                }
+            )
+
+        calls: list[dict[str, Any]] = []
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            callee: str | None = None
+            if isinstance(child.func, ast.Name):
+                callee = child.func.id
+            elif isinstance(child.func, ast.Attribute) and isinstance(child.func.value, ast.Name):
+                # skip module.attr like time.sleep; keep local-ish attr only if needed
+                continue
+            if callee and callee != node.name:
+                calls.append({"to": callee, "line": child.lineno})
+
+        results.append(
+            FunctionInfo(
+                name=node.name,
+                qname=function_qname(file_path, node.name, root),
+                file=file_path,
+                line=node.lineno,
+                is_async=isinstance(node, ast.AsyncFunctionDef),
+                decorators=decorators,
+                params=params,
+                calls=calls,
+                depends_on=_depends_from_signature(node),
+            )
+        )
+    return results
 
 
 def _join_paths(prefix: str, path: str) -> str:

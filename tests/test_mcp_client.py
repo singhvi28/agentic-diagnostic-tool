@@ -69,6 +69,7 @@ def test_inprocess_client_lists_and_calls_tools(inprocess_settings):
         assert "similar_bugs" in hybrid
         assert "dependency_graph" in hybrid
         assert "parsed_traceback" in hybrid
+        assert "fragile_routes" in hybrid
 
 
 def test_contextvar_get_mcp_client(inprocess_settings):

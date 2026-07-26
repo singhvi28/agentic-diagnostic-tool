@@ -18,12 +18,36 @@ def ingest(root: Path | None = None) -> dict:
 
     topology = extract_fastapi_topology(app_root)
     neo = Neo4jMemory(settings)
-    neo_counts: dict = {"routes": 0, "dependencies": 0, "skipped": True}
+    neo_counts: dict = {"routes": 0, "dependencies": 0, "functions": 0, "skipped": True}
+    error_patterns = 0
     try:
         if neo.ping():
             neo.ensure_constraints()
             neo_counts = neo.upsert_topology(topology)
             neo_counts["skipped"] = False
+
+            log_path = settings.error_log_path
+            if log_path.exists():
+                chunks = [
+                    c.strip()
+                    for c in log_path.read_text(encoding="utf-8").split("\n\n")
+                    if c.strip()
+                ]
+                patterns: list[dict] = []
+                for chunk in chunks:
+                    parsed = parse_traceback(chunk)
+                    frame = parsed.failing_frame
+                    patterns.append(
+                        {
+                            "exception_type": parsed.exception_type,
+                            "message": parsed.exception_message or "",
+                            "function_name": frame.function_name if frame else None,
+                            "line": frame.line_number if frame else None,
+                            "file": frame.filename if frame else None,
+                        }
+                    )
+                error_patterns = neo.upsert_error_patterns(patterns)
+                neo_counts["error_patterns"] = error_patterns
     except Exception as exc:  # noqa: BLE001
         neo_counts = {"error": str(exc)}
     finally:
@@ -53,7 +77,12 @@ def ingest(root: Path | None = None) -> dict:
                     pg.upsert_log(chunk, metadata=meta)
                     seeded += 1
     except Exception as exc:  # noqa: BLE001
-        return {"neo4j": neo_counts, "pgvector_seeded": seeded, "pgvector_error": str(exc), "root": str(app_root)}
+        return {
+            "neo4j": neo_counts,
+            "pgvector_seeded": seeded,
+            "pgvector_error": str(exc),
+            "root": str(app_root),
+        }
 
     return {"neo4j": neo_counts, "pgvector_seeded": seeded, "root": str(app_root)}
 
