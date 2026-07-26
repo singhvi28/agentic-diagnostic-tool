@@ -188,7 +188,9 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
 
     system = (
         "You diagnose FastAPI bugs (async blocking, Pydantic 500s, "
-        "Depends yield without finally, lifespan leaks). Return valid JSON only."
+        "Depends yield without finally, lifespan leaks). Return valid JSON only. "
+        "proposed_patch values MUST be unified diffs (start with --- and +++), "
+        "minimal hunks only — never dump full file contents."
     )
     prompt = (
         f"Traceback:\n{state.get('raw_log_entry')}\n\n"
@@ -198,7 +200,9 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
         f"Analyzer findings:\n{json.dumps(state.get('analyzer_findings'), default=str)}\n\n"
         f"Previous Test Result:\n{json.dumps(state.get('test_result'), default=str)}\n\n"
         "Respond as JSON with keys: root_cause_analysis (str), "
-        "proposed_patch (object mapping filename -> full new file content), "
+        "proposed_patch (object mapping relative filename -> unified diff text; "
+        "each value must start with --- / +++ and contain only minimal hunks — "
+        "do not return full file contents), "
         "reproduction_test_code (either a JSON HTTP suite "
         '[{"method":"GET","path":"/health","expect_status":200}] '
         "or Python with async test_* functions taking `client` "
@@ -313,7 +317,12 @@ def apply_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
         return {"apply_result": {"skipped": True, "reason": "tests did not pass"}}
     session_id = state.get("session_id") or ""
     proposed = state.get("proposed_patch") or {}
-    result = apply_patches(session_id, proposed)
+    result = apply_patches(
+        session_id,
+        proposed,
+        require_confirmation=True,
+        auto_yes=bool(state.get("apply_auto_yes")),
+    )
     _safe_event(session_id, "apply_patch", result)
     return {"apply_result": result}
 
