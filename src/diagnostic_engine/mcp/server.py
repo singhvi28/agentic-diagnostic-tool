@@ -122,15 +122,37 @@ def run_static_analyzers(file_path: str | None = None, function_name: str | None
 
 @mcp.tool()
 def search_similar_bugs(traceback_text: str, top_k: int = 3) -> dict[str, Any]:
-    """Semantic search over past logs/tracebacks in Postgres pgvector."""
+    """Search past bugs via pgvector and/or Neo4j FastRP structural similarity."""
     settings = get_settings()
+    parsed = parse_traceback(traceback_text)
+    results: list[dict[str, Any]] = []
+    structural: list[dict[str, Any]] = []
+
     pg = PgVectorMemory(settings)
     try:
-        if not pg.ping():
-            return {"results": [], "error": "Postgres unavailable"}
-        return {"results": pg.query_similar(traceback_text, top_k=top_k)}
+        if pg.ping():
+            results = pg.query_similar(traceback_text, top_k=top_k)
     except Exception as exc:  # noqa: BLE001
         return {"results": [], "error": str(exc)}
+
+    seed = parsed.failing_frame.function_name if parsed.failing_frame else None
+    neo = Neo4jMemory(settings)
+    try:
+        if seed and neo.ping():
+            from diagnostic_engine.memory.embeddings import FastRPEmbedder
+
+            embedder = FastRPEmbedder(neo)
+            structural = embedder.top_k_similar(seed, k=top_k)
+    except Exception:
+        structural = []
+    finally:
+        neo.close()
+
+    return {
+        "results": results,
+        "structural_similar_functions": structural,
+        "embedding_provider": settings.embedding_provider,
+    }
 
 
 @mcp.tool()
@@ -141,6 +163,7 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
 
     similar_logs: list[dict[str, Any]] = []
     graph_context: list[dict[str, Any]] = []
+    structural_neighbors: list[dict[str, Any]] = []
 
     pg = PgVectorMemory(settings)
     try:
@@ -159,6 +182,12 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
     try:
         if seed_function and neo.ping():
             graph_context = neo.traverse_from_function(seed_function, hops=3)
+            try:
+                from diagnostic_engine.memory.embeddings import FastRPEmbedder
+
+                structural_neighbors = FastRPEmbedder(neo).top_k_similar(seed_function, k=5)
+            except Exception:
+                structural_neighbors = []
             try:
                 fragile = neo.fragile_routes()
             except Exception:  # noqa: BLE001
@@ -187,6 +216,7 @@ def hybrid_root_cause_analysis(traceback_text: str) -> dict[str, Any]:
             ),
         },
         "similar_bugs": similar_logs,
+        "structural_similar_functions": structural_neighbors,
         "dependency_graph": graph_context,
         "fragile_routes": fragile if seed_function else [],
     }

@@ -47,6 +47,9 @@ packages = ["src/diagnostic_engine"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: needs live Neo4j and/or Postgres (docker compose)",
+]
 
 [tool.ruff]
 line-length = 100

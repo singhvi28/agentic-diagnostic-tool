@@ -493,6 +493,142 @@ class Neo4jMemory:
         with self.driver.session() as session:
             return [dict(record) for record in session.run(cypher)]
 
+    def gds_available(self) -> bool:
+        """True when Neo4j Graph Data Science procedures are installed."""
+        try:
+            with self.driver.session() as session:
+                row = session.run(
+                    "SHOW PROCEDURES YIELD name WHERE name STARTS WITH 'gds.fastRP' "
+                    "RETURN count(*) AS c"
+                ).single()
+                return bool(row and row["c"] > 0)
+        except Exception:
+            try:
+                with self.driver.session() as session:
+                    session.run("RETURN gds.version() AS v").single()
+                return True
+            except Exception:
+                return False
+
+    def write_fastrp_embeddings(
+        self,
+        *,
+        graph_name: str = "code-graph",
+        embedding_dimension: int = 128,
+        write_property: str = "graph_embedding",
+    ) -> dict[str, Any]:
+        """Project topology and write FastRP embeddings onto graph nodes.
+
+        Requires the Neo4j GDS plugin. Soft-fails with ``{"skipped": True, ...}``
+        when GDS is unavailable or the graph has too few nodes.
+        """
+        if not self.gds_available():
+            return {"skipped": True, "reason": "gds_unavailable"}
+
+        with self.driver.session() as session:
+            # Drop prior in-memory projection if present
+            exists = session.run(
+                "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+                name=graph_name,
+            ).single()
+            if exists and exists["exists"]:
+                session.run("CALL gds.graph.drop($name) YIELD graphName", name=graph_name)
+
+            fn_count = session.run("MATCH (f:Function) RETURN count(f) AS c").single()
+            if not fn_count or fn_count["c"] < 2:
+                return {"skipped": True, "reason": "too_few_functions", "functions": fn_count["c"] if fn_count else 0}
+
+            session.run(
+                """
+                CALL gds.graph.project.cypher(
+                  $name,
+                  'MATCH (n)
+                   WHERE n:Function OR n:Endpoint OR n:Dependency
+                      OR n:Decorator OR n:ErrorPattern OR n:Parameter
+                   RETURN id(n) AS id',
+                  'MATCH (a)-[r]->(b)
+                   WHERE type(r) IN [
+                     \"DEPENDS_ON\", \"CALLS\", \"HANDLED_BY\", \"DECORATED_WITH\",
+                     \"DEFINES_ROUTE\", \"ORIGINATED_IN\", \"HAS_PARAM\", \"TYPED_AS\"
+                   ]
+                   RETURN id(a) AS source, id(b) AS target, type(r) AS type'
+                )
+                YIELD graphName, nodeCount, relationshipCount
+                RETURN graphName, nodeCount, relationshipCount
+                """,
+                name=graph_name,
+            )
+
+            result = session.run(
+                """
+                CALL gds.fastRP.write($name, {
+                  embeddingDimension: $dim,
+                  iterationWeights: [0.0, 1.0, 1.0, 0.5],
+                  writeProperty: $prop
+                })
+                YIELD nodePropertiesWritten
+                RETURN nodePropertiesWritten
+                """,
+                name=graph_name,
+                dim=embedding_dimension,
+                prop=write_property,
+            ).single()
+            written = int(result["nodePropertiesWritten"]) if result else 0
+
+            # Drop in-memory graph to free memory; embeddings remain on store nodes
+            try:
+                session.run("CALL gds.graph.drop($name) YIELD graphName", name=graph_name)
+            except Exception:
+                pass
+
+            return {
+                "skipped": False,
+                "node_properties_written": written,
+                "embedding_dimension": embedding_dimension,
+                "write_property": write_property,
+            }
+
+    def get_function_graph_embedding(self, function_name: str) -> list[float] | None:
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (f:Function {name: $name})
+                WHERE f.graph_embedding IS NOT NULL
+                RETURN f.graph_embedding AS emb
+                LIMIT 1
+                """,
+                name=function_name,
+            ).single()
+            if not record or record["emb"] is None:
+                return None
+            return list(record["emb"])
+
+    def similar_functions_by_fastrp(
+        self,
+        function_name: str,
+        k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """KNN over Function.graph_embedding via GDS cosine similarity."""
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (target:Function {name: $name})
+                WHERE target.graph_embedding IS NOT NULL
+                MATCH (other:Function)
+                WHERE other <> target AND other.graph_embedding IS NOT NULL
+                WITH target, other,
+                     gds.similarity.cosine(
+                       target.graph_embedding, other.graph_embedding
+                     ) AS sim
+                ORDER BY sim DESC
+                LIMIT $k
+                RETURN other.name AS name, other.qname AS qname, sim
+                """,
+                name=function_name,
+                k=k,
+            )
+            return [dict(r) for r in result]
+
     def ping(self) -> bool:
         try:
             with self.driver.session() as session:

@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LLMProvider = Literal["openai", "gemini", "cursor"]
-EmbeddingProvider = Literal["hash", "openai", "gemini"]
+EmbeddingProvider = Literal["hash", "openai", "gemini", "fastrp", "auto"]
 McpTransport = Literal["stdio", "http", "inprocess"]
 
 

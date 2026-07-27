@@ -76,3 +76,18 @@ def test_ingest_seeds_error_patterns(neo: Neo4jMemory):
     assert ctx
     structural = next((c for c in ctx if c.get("kind") == "structural"), ctx[0])
     assert structural.get("function_name") == "checkout" or structural.get("endpoint")
+
+
+@pytest.mark.integration
+def test_fastrp_embeddings_when_gds_available(neo: Neo4jMemory):
+    ingest(TARGET_ROOT)
+    if not neo.gds_available():
+        pytest.skip("Neo4j GDS plugin not installed")
+    result = neo.write_fastrp_embeddings(embedding_dimension=128)
+    assert result.get("skipped") is False
+    assert result.get("node_properties_written", 0) >= 1
+    emb = neo.get_function_graph_embedding("checkout")
+    assert emb is not None
+    assert len(emb) == 128
+    neighbors = neo.similar_functions_by_fastrp("checkout", k=3)
+    assert isinstance(neighbors, list)

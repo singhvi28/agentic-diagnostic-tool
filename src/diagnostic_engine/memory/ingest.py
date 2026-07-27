@@ -48,6 +48,12 @@ def ingest(root: Path | None = None) -> dict:
                     )
                 error_patterns = neo.upsert_error_patterns(patterns)
                 neo_counts["error_patterns"] = error_patterns
+
+            try:
+                fastrp = neo.write_fastrp_embeddings(embedding_dimension=128)
+                neo_counts["fastrp"] = fastrp
+            except Exception as exc:  # noqa: BLE001
+                neo_counts["fastrp"] = {"skipped": True, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         neo_counts = {"error": str(exc)}
     finally:

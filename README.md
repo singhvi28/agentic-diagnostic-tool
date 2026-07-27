@@ -21,8 +21,11 @@ alembic upgrade head
 # 3. Ingest the sample buggy app into Neo4j (+ seed pgvector from logs)
 diagnostic-ingest
 
-# 4. Unit tests
-pytest -q
+# 4. Unit tests (skip integration when Docker is down)
+pytest -q -m "not integration"
+
+# Integration suite (needs Neo4j + Postgres from compose)
+pytest -q -m integration
 
 # 5. Run the diagnostic agent (spawns MCP over stdio by default)
 diagnostic-agent --log logs/app_errors.log
@@ -86,7 +89,7 @@ Set `LLM_PROVIDER` and the matching API key in `.env`:
 | `gemini` | `GEMINI_API_KEY` | `gemini-3-flash-preview` |
 | `cursor` | `CURSOR_API_KEY` | `composer-2.5` |
 
-Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING_PROVIDER=hash|openai|gemini`.
+Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING_PROVIDER=hash|openai|gemini|fastrp|auto` (without an API key, FastRP structural vectors are preferred over hash when Neo4j GDS is available).
 
 ## MCP surface
 
@@ -107,8 +110,9 @@ Optional: `LLM_MODEL=...` overrides the provider default. Embeddings: `EMBEDDING
 
 - LangGraph retrieve/fetch/execute nodes call MCP tools via `DiagnosticMcpClient` (stdio/HTTP); session DB + LLM diagnose stay local.
 - Reproduction tests run **in-process** via `httpx.ASGITransport` (JSON HTTP suite or Python `test_*` with injected `client`) — no pytest tempfile subprocess.
-- Default embeddings are deterministic hash vectors (`EMBEDDING_PROVIDER=hash`). Use `openai` or `gemini` for real embeddings.
+- Default embeddings prefer **Neo4j FastRP** structural vectors when OpenAI/Gemini keys are missing (falls back to hash if GDS/Neo4j unavailable). Set `EMBEDDING_PROVIDER=openai|gemini|fastrp|hash|auto`.
 - Without the active provider’s API key, the diagnose/patch node returns a stub RCA so the graph still runs and sessions are recorded.
 - Cursor provider uses the Cursor SDK (`Agent.prompt` + Composer 2.5) and asks for JSON-only output without file edits.
 - `--apply` applies LLM **unified diffs** only (not full files): review gate by default, `--yes` to auto-confirm, timestamped backups + rollback on `patch` failure.
+- Integration tests (`pytest -m integration`) need `docker compose up -d` (Neo4j + Postgres); they skip when backends are down. Use `pytest -m "not integration"` for unit-only runs.
 - Sample bugs in `examples/target_app`: blocking `time.sleep` in async handler, DI yield without `try/finally`, unhandled index error → 500.
