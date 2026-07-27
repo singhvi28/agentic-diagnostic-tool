@@ -620,6 +620,7 @@ class Neo4jMemory:
                      gds.similarity.cosine(
                        target.graph_embedding, other.graph_embedding
                      ) AS sim
+                WHERE sim IS NOT NULL AND NOT isNaN(sim)
                 ORDER BY sim DESC
                 LIMIT $k
                 RETURN other.name AS name, other.qname AS qname, sim
