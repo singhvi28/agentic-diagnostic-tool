@@ -6,10 +6,20 @@ import argparse
 from pathlib import Path
 
 from diagnostic_engine.analysis.fastapi_routes import extract_fastapi_topology
-from diagnostic_engine.analysis.traceback_parser import parse_traceback
+from diagnostic_engine.analysis.traceback_parser import (
+    parse_traceback_chunk,
+    split_traceback_chunks,
+)
 from diagnostic_engine.config import get_settings
 from diagnostic_engine.memory.neo4j_client import Neo4jMemory
 from diagnostic_engine.memory.pgvector_client import PgVectorMemory
+
+
+def _log_traceback_chunks(log_path: Path) -> list[str]:
+    """Split an error log into individual traceback stacks."""
+    if not log_path.exists():
+        return []
+    return split_traceback_chunks(log_path.read_text(encoding="utf-8"))
 
 
 def ingest(root: Path | None = None) -> dict:
@@ -27,25 +37,21 @@ def ingest(root: Path | None = None) -> dict:
             neo_counts["skipped"] = False
 
             log_path = settings.error_log_path
-            if log_path.exists():
-                chunks = [
-                    c.strip()
-                    for c in log_path.read_text(encoding="utf-8").split("\n\n")
-                    if c.strip()
-                ]
-                patterns: list[dict] = []
-                for chunk in chunks:
-                    parsed = parse_traceback(chunk)
-                    frame = parsed.failing_frame
-                    patterns.append(
-                        {
-                            "exception_type": parsed.exception_type,
-                            "message": parsed.exception_message or "",
-                            "function_name": frame.function_name if frame else None,
-                            "line": frame.line_number if frame else None,
-                            "file": frame.filename if frame else None,
-                        }
-                    )
+            chunks = _log_traceback_chunks(log_path)
+            patterns: list[dict] = []
+            for chunk in chunks:
+                parsed = parse_traceback_chunk(chunk)
+                frame = parsed.failing_frame
+                patterns.append(
+                    {
+                        "exception_type": parsed.exception_type,
+                        "message": parsed.exception_message or "",
+                        "function_name": frame.function_name if frame else None,
+                        "line": frame.line_number if frame else None,
+                        "file": frame.filename if frame else None,
+                    }
+                )
+            if patterns:
                 error_patterns = neo.upsert_error_patterns(patterns)
                 neo_counts["error_patterns"] = error_patterns
 
@@ -65,23 +71,17 @@ def ingest(root: Path | None = None) -> dict:
         if pg.ping():
             pg.ensure_schema()
             log_path = settings.error_log_path
-            if log_path.exists():
-                chunks = [
-                    c.strip()
-                    for c in log_path.read_text(encoding="utf-8").split("\n\n")
-                    if c.strip()
-                ]
-                for chunk in chunks:
-                    parsed = parse_traceback(chunk)
-                    meta = {
-                        "source": str(log_path),
-                        "exception_type": parsed.exception_type,
-                        "function_name": (
-                            parsed.failing_frame.function_name if parsed.failing_frame else None
-                        ),
-                    }
-                    pg.upsert_log(chunk, metadata=meta)
-                    seeded += 1
+            for chunk in _log_traceback_chunks(log_path):
+                parsed = parse_traceback_chunk(chunk)
+                meta = {
+                    "source": str(log_path),
+                    "exception_type": parsed.exception_type,
+                    "function_name": (
+                        parsed.failing_frame.function_name if parsed.failing_frame else None
+                    ),
+                }
+                pg.upsert_log(chunk, metadata=meta)
+                seeded += 1
     except Exception as exc:  # noqa: BLE001
         return {
             "neo4j": neo_counts,

@@ -4,7 +4,11 @@ from pathlib import Path
 
 from diagnostic_engine.analysis.async_blocking import analyze_async_blocking
 from diagnostic_engine.analysis.fastapi_routes import extract_fastapi_topology
-from diagnostic_engine.analysis.traceback_parser import parse_traceback
+from diagnostic_engine.analysis.traceback_parser import (
+    parse_all_tracebacks,
+    parse_traceback,
+    select_primary_traceback,
+)
 from diagnostic_engine.analyzers.scanner import run_analyzers
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +27,30 @@ def test_parse_traceback_extracts_failing_frame():
     assert parsed.failing_frame is not None
     assert parsed.failing_frame.function_name == "checkout"
     assert parsed.failing_frame.line_number == 64
+
+
+def test_parse_all_tracebacks_from_app_errors_log():
+    log = (ROOT / "logs" / "app_errors.log").read_text(encoding="utf-8")
+    all_tb = parse_all_tracebacks(log)
+    assert len(all_tb) == 2
+    types = {tb.exception_type for tb in all_tb}
+    assert types == {"KeyboardInterrupt", "IndexError"}
+    by_type = {tb.exception_type: tb for tb in all_tb}
+    assert by_type["KeyboardInterrupt"].failing_frame.function_name == "checkout"
+    assert by_type["IndexError"].failing_frame.function_name == "get_order"
+
+
+def test_select_primary_prefers_async_blocking_over_indexerror():
+    log = (ROOT / "logs" / "app_errors.log").read_text(encoding="utf-8")
+    all_tb = parse_all_tracebacks(log)
+    primary = select_primary_traceback(all_tb)
+    assert primary.exception_type == "KeyboardInterrupt"
+    assert primary.failing_frame is not None
+    assert primary.failing_frame.function_name == "checkout"
+    # Wrapper must not silently pick the last stack (IndexError / get_order)
+    wrapped = parse_traceback(log)
+    assert wrapped.failing_frame.function_name == "checkout"
+    assert wrapped.exception_type == "KeyboardInterrupt"
 
 
 def test_async_blocking_detects_time_sleep():

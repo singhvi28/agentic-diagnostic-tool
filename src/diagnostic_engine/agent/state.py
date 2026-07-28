@@ -15,6 +15,7 @@ class FastAPIDiagnosticState(TypedDict, total=False):
     apply_patches: bool
     apply_auto_yes: bool
     parsed_traceback: Optional[ParsedTraceback]
+    parsed_tracebacks: list[ParsedTraceback]
     historical_cases: list[dict[str, Any]]
     dependency_graph: list[dict[str, Any]]
     source_code_snippets: dict[str, str]

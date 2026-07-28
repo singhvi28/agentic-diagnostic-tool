@@ -9,7 +9,12 @@ from typing import Any
 from diagnostic_engine.agent.apply_patch import apply_patches
 from diagnostic_engine.agent.mcp_client import get_mcp_client
 from diagnostic_engine.agent.state import FastAPIDiagnosticState
-from diagnostic_engine.analysis.traceback_parser import parse_traceback
+from diagnostic_engine.analysis.traceback_parser import (
+    parse_all_tracebacks,
+    parse_traceback,
+    select_primary_traceback,
+    traceback_summary,
+)
 from diagnostic_engine.config import get_settings
 from diagnostic_engine.db import repository as repo
 
@@ -56,7 +61,8 @@ def parse_log_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     raw = state.get("raw_log_entry") or ""
     if not raw and settings.error_log_path.exists():
         raw = settings.error_log_path.read_text(encoding="utf-8")
-    parsed = parse_traceback(raw)
+    all_tb = parse_all_tracebacks(raw)
+    parsed = select_primary_traceback(all_tb) if all_tb else parse_traceback(raw)
 
     session_id = state.get("session_id")
     try:
@@ -74,6 +80,7 @@ def parse_log_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     out = {
         "raw_log_entry": raw,
         "parsed_traceback": parsed,
+        "parsed_tracebacks": all_tb or ([parsed] if parsed.failing_frame else []),
         "session_id": session_id,
         "retry_count": 0,
         "max_retries": settings.max_retries,
@@ -81,12 +88,22 @@ def parse_log_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     _safe_event(session_id, "parse_log", {
         "exception_type": parsed.exception_type,
         "failing_function": parsed.failing_frame.function_name if parsed.failing_frame else None,
+        "traceback_count": len(out["parsed_tracebacks"]),
+        "exceptions": [
+            traceback_summary(tb, is_primary=(tb is parsed))
+            for tb in out["parsed_tracebacks"]
+        ],
     })
     return out
 
 
 def retrieve_graphrag_context_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
-    raw = state.get("raw_log_entry", "")
+    # Prefer primary traceback text for hybrid seed; fall back to full log
+    primary = state.get("parsed_traceback")
+    raw = (
+        (primary.raw_chunk if primary and primary.raw_chunk else None)
+        or state.get("raw_log_entry", "")
+    )
     historical: list[dict[str, Any]] = []
     graph: list[dict[str, Any]] = []
 
@@ -98,7 +115,13 @@ def retrieve_graphrag_context_node(state: FastAPIDiagnosticState) -> dict[str, A
         )
         if isinstance(result, dict):
             historical = result.get("similar_bugs") or []
-            graph = result.get("dependency_graph") or []
+            graph = list(result.get("dependency_graph") or [])
+            fragile = result.get("fragile_routes") or []
+            if fragile:
+                graph.append({"kind": "fragile_routes", "routes": fragile})
+            structural = result.get("structural_similar_functions") or []
+            if structural:
+                graph.append({"kind": "structural_similar_functions", "neighbors": structural})
         else:
             historical = [{"error": f"unexpected MCP payload: {result!r}"}]
     except Exception as exc:  # noqa: BLE001
@@ -115,21 +138,45 @@ def retrieve_graphrag_context_node(state: FastAPIDiagnosticState) -> dict[str, A
 def fetch_source_code_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     settings = get_settings()
     parsed = state.get("parsed_traceback")
+    all_tb = list(state.get("parsed_tracebacks") or [])
+    if parsed and parsed not in all_tb:
+        all_tb = [parsed, *all_tb]
+
     snippets: dict[str, str] = {}
     findings: dict[str, Any] = {}
+    all_ast_findings: list[dict[str, Any]] = []
     analyzer_findings: list[dict[str, Any]] = []
     target_file: str | None = None
     target_fn: str | None = None
 
     mcp = get_mcp_client()
 
+    # Unique (rel_path, function) targets — primary first, then others (cap 3)
+    targets: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    ordered = []
     if parsed and parsed.failing_frame:
-        frame = parsed.failing_frame
-        target_fn = frame.function_name
+        ordered.append(parsed)
+    for tb in all_tb:
+        if tb is not parsed:
+            ordered.append(tb)
+    for tb in ordered:
+        frame = tb.failing_frame
+        if not frame:
+            continue
+        rel = _sandbox_relative_path(frame.filename, settings.sandbox_root)
+        key = (rel, frame.function_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append((rel, frame.function_name, frame.line_number))
+        if len(targets) >= 3:
+            break
+
+    for i, (file_path, fn_name, line_number) in enumerate(targets):
         try:
-            file_path = _sandbox_relative_path(frame.filename, settings.sandbox_root)
-            start = max(1, frame.line_number - 15)
-            end = frame.line_number + 15
+            start = max(1, line_number - 15)
+            end = line_number + 15
             result = mcp.call_tool(
                 "read_code",
                 {
@@ -139,23 +186,33 @@ def fetch_source_code_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
                 },
             )
             if isinstance(result, dict):
-                snippets[result.get("file", file_path)] = result.get("content", "")
-                target_file = result.get("file", file_path)
+                key = result.get("file", file_path)
+                # Disambiguate multiple snippets from same file
+                if key in snippets and fn_name:
+                    key = f"{key}::{fn_name}"
+                snippets[key] = result.get("content", "")
+                if i == 0:
+                    target_file = result.get("file", file_path)
+                    target_fn = fn_name
             else:
-                snippets["error"] = f"unexpected read_code payload: {result!r}"
+                snippets[f"error:{file_path}"] = f"unexpected read_code payload: {result!r}"
 
-            if target_file and target_fn:
-                # Prefer sandbox-relative path for AST tool
-                ast_path = file_path
-                findings = mcp.call_tool(
-                    "analyze_ast_for_async_blocking",
-                    {"file_path": ast_path, "function_name": target_fn},
+            ast_result = mcp.call_tool(
+                "analyze_ast_for_async_blocking",
+                {"file_path": file_path, "function_name": fn_name},
+            )
+            if isinstance(ast_result, dict):
+                if i == 0:
+                    findings = ast_result
+                all_ast_findings.append(
+                    {"function_name": fn_name, "file_path": file_path, **ast_result}
                 )
-                if not isinstance(findings, dict):
-                    findings = {"raw": findings}
+            elif i == 0:
+                findings = {"raw": ast_result}
         except Exception as exc:  # noqa: BLE001
-            snippets["error"] = str(exc)
+            snippets[f"error:{file_path}"] = str(exc)
 
+    # Analyzers: primary target, then merge findings from other functions
     try:
         args: dict[str, Any] = {}
         if target_file:
@@ -164,11 +221,33 @@ def fetch_source_code_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
             args["function_name"] = target_fn
         scan = mcp.call_tool("run_static_analyzers", args)
         if isinstance(scan, dict):
-            analyzer_findings = scan.get("findings") or []
+            analyzer_findings = list(scan.get("findings") or [])
         else:
             analyzer_findings = [{"error": f"unexpected analyzers payload: {scan!r}"}]
     except Exception as exc:  # noqa: BLE001
         analyzer_findings = [{"error": str(exc)}]
+
+    for file_path, fn_name, _line in targets[1:]:
+        try:
+            scan = mcp.call_tool(
+                "run_static_analyzers",
+                {"file_path": file_path, "function_name": fn_name},
+            )
+            if isinstance(scan, dict):
+                for finding in scan.get("findings") or []:
+                    if finding not in analyzer_findings:
+                        analyzer_findings.append(finding)
+        except Exception:
+            pass
+
+    if all_ast_findings and "issues" not in findings:
+        # Flatten multi-function AST issues into primary findings bag
+        merged_issues = []
+        for item in all_ast_findings:
+            for issue in item.get("issues") or []:
+                merged_issues.append({**issue, "function_name": item.get("function_name")})
+        if merged_issues:
+            findings = {**findings, "issues": merged_issues, "multi_function": all_ast_findings}
 
     out = {
         "source_code_snippets": snippets,
@@ -178,6 +257,7 @@ def fetch_source_code_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     _safe_event(state.get("session_id"), "fetch_source", {
         "finding_count": len(analyzer_findings),
         "snippet_files": list(snippets.keys()),
+        "targets": [{"file": f, "function": fn} for f, fn, _ in targets],
     })
     return out
 
@@ -186,14 +266,24 @@ def diagnose_and_patch_node(state: FastAPIDiagnosticState) -> dict[str, Any]:
     settings = get_settings()
     retry = state.get("retry_count", 0) + 1
 
+    primary = state.get("parsed_traceback")
+    all_tb = list(state.get("parsed_tracebacks") or [])
+    exceptions_ctx = [
+        traceback_summary(tb, is_primary=(tb is primary or tb == primary))
+        for tb in (all_tb or ([primary] if primary else []))
+    ]
+
     system = (
         "You diagnose FastAPI bugs (async blocking, Pydantic 500s, "
         "Depends yield without finally, lifespan leaks). Return valid JSON only. "
         "proposed_patch values MUST be unified diffs (start with --- and +++), "
-        "minimal hunks only — never dump full file contents."
+        "minimal hunks only — never dump full file contents. "
+        "When multiple exceptions appear in the log, prioritize the primary "
+        "(especially async/blocking issues) while noting secondary bugs."
     )
     prompt = (
         f"Traceback:\n{state.get('raw_log_entry')}\n\n"
+        f"All exceptions in log:\n{json.dumps(exceptions_ctx, default=str)}\n\n"
         f"Graph Context:\n{json.dumps(state.get('dependency_graph'), default=str)}\n\n"
         f"Historical cases:\n{json.dumps(state.get('historical_cases'), default=str)}\n\n"
         f"Snippets:\n{json.dumps(state.get('source_code_snippets'), default=str)}\n\n"
